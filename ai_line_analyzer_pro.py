@@ -504,7 +504,7 @@ def predict_today(model, edges_rows):
         feat=[fair_p,book_p,dec,ev,edge,kly,side]
         for k,v in sorted(extras.items()):
             try: feat.append(float(v))
-        except Exception:
+            except Exception:
             pass
         X=np.array(feat).reshape(1,-1)
         p = float(model.predict_proba(X)[0][1])
