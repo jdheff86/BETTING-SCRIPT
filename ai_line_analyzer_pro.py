@@ -499,13 +499,16 @@ def predict_today(model, edges_rows):
             home,away = got
             side = 1.0 if r[7]==home else 0.0
         extras={}
-        try: extras=json.loads(r[15]) or {}
-        except Exception: extras={}
+        try:
+            extras=json.loads(r[15]) or {}
+        except Exception:
+            extras={}
         feat=[fair_p,book_p,dec,ev,edge,kly,side]
         for k,v in sorted(extras.items()):
-            try: feat.append(float(v))
+            try:
+                feat.append(float(v))
             except Exception:
-            pass
+                pass
         X=np.array(feat).reshape(1,-1)
         p = float(model.predict_proba(X)[0][1])
         model_ev = ev_from_p_o(p, dec)
