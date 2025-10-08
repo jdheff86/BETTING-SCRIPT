@@ -1,11 +1,12 @@
 # ai_line_analyzer_pro.py
 # Deep odds analyzer: consensus EV, AI model, locks, arbitrage, middles, Kelly, feature hooks.
-# Now filters to "today" (America/New_York) by default so it won't show games from other days.
+# Now supports exact local date (--date YYYY-MM-DD) and multi-day windows (--window-days N).
 
 import os, sys, csv, math, json, sqlite3, datetime as dt
 from collections import defaultdict
 from typing import List, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
+import argparse
 
 import requests
 import numpy as np
@@ -26,7 +27,7 @@ MARKETS = ["h2h", "spreads", "totals"]
 LOCKS_TOP_N = 5
 DB_PATH = "odds_ai.db"
 TIMEZONE = "America/New_York"
-WINDOW_DAYS = 1   # only consider events starting today (set to 2 for today+tomorrow)
+WINDOW_DAYS = 1   # default: only consider events starting today; override via --window-days
 DATE_STR = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
 BASE = "https://api.the-odds-api.com/v4/sports"
 
@@ -188,10 +189,13 @@ def upsert_event(conn, sport_key, eid, home, away, commence):
               """, (sport_key,eid,home,away,commence))
     conn.commit()
 
-# ===== TIME FILTERING =========================================================
+# ===== TIME HELPERS (robust to ...000Z etc.) =================================
 def utc_to_local(iso_utc: str, tz: ZoneInfo):
     try:
-        utc = dt.datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+        s = iso_utc.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"  # handle 'Z' and '...000Z'
+        utc = dt.datetime.fromisoformat(s)
         return utc.astimezone(tz)
     except Exception:
         return None
@@ -278,13 +282,18 @@ def feature_bundle(ctx: Dict[str,Any]) -> Dict[str,float]:
     return f
 
 # ===== INGEST & CONSENSUS =====================================================
-def run_ingest_and_consensus():
+def run_ingest_and_consensus(target_date: dt.date = None, window_days: int = None):
     conn = sqlite3.connect(DB_PATH); ensure_schema(conn)
 
     tz = ZoneInfo(TIMEZONE)
-    now_local = dt.datetime.now(tz)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + dt.timedelta(days=WINDOW_DAYS)
+    if target_date is None:
+        target_date = dt.datetime.now(tz).date()
+    if window_days is None:
+        window_days = WINDOW_DAYS
+
+    # exact start-of-day → end-of-window (local time)
+    start_local = dt.datetime.combine(target_date, dt.time(0,0,0), tzinfo=tz)
+    end_local   = start_local + dt.timedelta(days=window_days)
 
     try:
         sports = get_sports()
@@ -305,8 +314,9 @@ def run_ingest_and_consensus():
         for ev in events:
             eid = ev.get("id"); commence = ev.get("commence_time")
             commence_local = utc_to_local(commence, tz)
+            # keep only events in [start_local, end_local)
             if not commence_local or not (start_local <= commence_local < end_local):
-                continue  # filter to "today" window
+                continue
 
             home = ev.get("home_team"); away = ev.get("away_team")
             upsert_event(sqlite3.connect(DB_PATH), skey, eid, home, away, commence)
@@ -494,7 +504,8 @@ def predict_today(model, edges_rows):
         feat=[fair_p,book_p,dec,ev,edge,kly,side]
         for k,v in sorted(extras.items()):
             try: feat.append(float(v))
-            except Exception: pass
+        except Exception:
+            pass
         X=np.array(feat).reshape(1,-1)
         p = float(model.predict_proba(X)[0][1])
         model_ev = ev_from_p_o(p, dec)
@@ -606,12 +617,29 @@ def main():
     if not API_KEY or len(API_KEY)<20:
         print("Put a valid API key in API_KEY"); sys.exit(1)
 
-    # 1) ingest + consensus (today only, local time)
-    cons_rows, h2h = run_ingest_and_consensus()
+    # CLI: allow exact date and multi-day windows
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="YYYY-MM-DD in America/New_York (default: today)", default=None)
+    parser.add_argument("--window-days", type=int, help="How many local days to include starting at --date (default from WINDOW_DAYS)", default=None)
+    args = parser.parse_args()
+
+    tz = ZoneInfo(TIMEZONE)
+    if args.date:
+        try:
+            target_date = dt.date.fromisoformat(args.date)
+        except Exception:
+            print("Invalid --date (use YYYY-MM-DD)."); sys.exit(1)
+    else:
+        target_date = dt.datetime.now(tz).date()
+
+    window_days = args.window_days if args.window_days is not None else WINDOW_DAYS
+
+    # 1) ingest + consensus for the requested slice
+    cons_rows, h2h = run_ingest_and_consensus(target_date=target_date, window_days=window_days)
 
     # 2) Locks (Consensus & Model)
     cons_h2h = [r for r in cons_rows if r[5]=="h2h"]
-    locks_cons = sorted(cons_h2h, key=lambda r:r[10], reverse=True)[:LOCKS_TOP_N]  # by fair_p_consensus
+    locks_cons = sorted(cons_h2h, key=lambda r:r[10], reverse=True)[:LOCKS_TOP_N]
 
     # 3) Train model (optional)
     X,y,_ = build_training_matrix(); model = train_model(X,y)
